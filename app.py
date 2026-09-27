@@ -85,6 +85,19 @@ class CustodyStore:
                     method TEXT NOT NULL, actor_id TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL, UNIQUE(parent_evidence_id,child_evidence_id)
                 );
+                CREATE TABLE IF NOT EXISTS transfers(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transfer_no TEXT UNIQUE,
+                    evidence_id INTEGER NOT NULL REFERENCES evidence(id),
+                    from_person TEXT NOT NULL, to_person TEXT NOT NULL,
+                    location TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','withdrawn')),
+                    initiated_by TEXT NOT NULL REFERENCES users(id),
+                    last_reject_reason TEXT,
+                    decided_by TEXT, decided_at TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_transfers_pending ON transfers(evidence_id,status);
                 CREATE TABLE IF NOT EXISTS audit_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     case_id INTEGER NOT NULL REFERENCES cases(id), actor_id TEXT NOT NULL REFERENCES users(id),
@@ -246,24 +259,153 @@ class CustodyStore:
             result["integrity_valid"] = hashlib.sha256(row["content"]).hexdigest() == row["sha256"]
             result["events"] = [dict(x) for x in conn.execute("SELECT * FROM custody_events WHERE evidence_id=? ORDER BY sequence", (evidence_id,)).fetchall()]
             result["derived_children"] = [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (evidence_id,)).fetchall()]
+            result["pending_transfer"] = self._transfer_dict(self._pending_transfer(conn, evidence_id))
+            result["transfers"] = [dict(x) for x in conn.execute("SELECT * FROM transfers WHERE evidence_id=? ORDER BY id DESC", (evidence_id,)).fetchall()]
             if include_content:
                 result["content_b64"] = base64.b64encode(row["content"]).decode()
             return result
 
+    def _pending_transfer(self, conn, evidence_id):
+        return conn.execute(
+            "SELECT * FROM transfers WHERE evidence_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (evidence_id,)
+        ).fetchone()
+
+    def _require_no_pending_transfer(self, conn, evidence_id, action):
+        if self._pending_transfer(conn, evidence_id):
+            raise BusinessError(f"证据处于交接中，{action}已暂停", 409, "transfer_pending")
+
+    def _latest_hold_reason(self, conn, evidence_id):
+        row = conn.execute(
+            "SELECT note FROM custody_events WHERE evidence_id=? AND event_type='HOLD_SET' ORDER BY sequence DESC LIMIT 1",
+            (evidence_id,),
+        ).fetchone()
+        return row["note"] if row else "未记录原因"
+
+    @staticmethod
+    def _transfer_dict(row):
+        return dict(row) if row else None
+
     def transfer(self, user_id, evidence_id, to_person, location, note=""):
-        if not to_person.strip() or not location.strip():
+        to_person, location, note = (to_person or "").strip(), (location or "").strip(), (note or "").strip()
+        if not to_person or not location:
             raise BusinessError("接收人和保管位置不能为空", 422, "invalid_transfer")
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
-                _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._member(conn, row["case_id"], user_id, {"custodian"})
                 if row["status"] == "released":
                     raise BusinessError("已释放证据不能再移交", 409, "evidence_released")
-                self._append_event(conn, evidence_id, "TRANSFER", user_id, from_person=row["current_custodian"], to_person=to_person.strip(), location=location.strip(), note=note.strip())
-                conn.execute("UPDATE evidence SET current_custodian=? WHERE id=?", (to_person.strip(), evidence_id))
-                self._audit(conn, row["case_id"], user_id, "custody.transfer", {"evidence_id": evidence_id, "to": to_person.strip(), "location": location.strip()})
-                return {"id": evidence_id, "current_custodian": to_person.strip(), "location": location.strip()}
+                self._require_no_pending_transfer(conn, evidence_id, "再次移交")
+                recipient = conn.execute("SELECT id FROM users WHERE id=? AND active=1", (to_person,)).fetchone()
+                if not recipient:
+                    raise BusinessError("接收人不存在或已停用", 422, "unknown_recipient")
+                member = conn.execute(
+                    "SELECT 1 FROM case_members WHERE case_id=? AND user_id=? AND active=1", (row["case_id"], to_person)
+                ).fetchone()
+                if not member:
+                    raise BusinessError("接收人不是本案有效成员", 422, "invalid_recipient")
+                ts = now()
+                cur = conn.execute(
+                    """INSERT INTO transfers(evidence_id,from_person,to_person,location,note,initiated_by,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (evidence_id, row["current_custodian"], to_person, location, note, user_id, ts, ts),
+                )
+                transfer_id = cur.lastrowid
+                transfer_no = f"TR-{datetime.now(timezone.utc):%Y%m%d}-{transfer_id:04d}"
+                conn.execute("UPDATE transfers SET transfer_no=? WHERE id=?", (transfer_no, transfer_id))
+                self._audit(conn, row["case_id"], user_id, "custody.transfer.initiate",
+                            {"evidence_id": evidence_id, "transfer_no": transfer_no,
+                             "from": row["current_custodian"], "to": to_person, "location": location})
+                return {"id": evidence_id, "transfer_no": transfer_no, "status": "pending",
+                        "from_person": row["current_custodian"], "to_person": to_person,
+                        "current_custodian": row["current_custodian"], "location": location}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def confirm_transfer(self, user_id, evidence_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                self._user(conn, user_id)
+                transfer = self._pending_transfer(conn, evidence_id)
+                if not transfer:
+                    raise BusinessError("该证据没有待处理的交接", 409, "no_pending_transfer")
+                if transfer["to_person"] != user_id:
+                    raise BusinessError("只有待接收人可以确认交接", 403, "forbidden")
+                if transfer["last_reject_reason"]:
+                    raise BusinessError("交接因法律保留被拒绝，需原发起人重新提交", 409, "transfer_rejected")
+                if row["legal_hold"]:
+                    reason = self._latest_hold_reason(conn, evidence_id)
+                    message = f"存在法律保留，无法确认交接：{reason}"
+                    conn.execute("UPDATE transfers SET last_reject_reason=?, updated_at=? WHERE id=?",
+                                 (message, now(), transfer["id"]))
+                    self._audit(conn, row["case_id"], user_id, "custody.transfer.confirm_rejected",
+                                {"evidence_id": evidence_id, "transfer_no": transfer["transfer_no"], "reason": reason})
+                    conn.commit()
+                    raise BusinessError(message, 409, "legal_hold_active")
+                ts = now()
+                conn.execute("UPDATE evidence SET current_custodian=? WHERE id=?", (transfer["to_person"], evidence_id))
+                conn.execute("UPDATE transfers SET status='confirmed', decided_by=?, decided_at=?, updated_at=? WHERE id=?",
+                             (user_id, ts, ts, transfer["id"]))
+                note = f"交接单 {transfer['transfer_no']} 经接收人确认"
+                if transfer["note"]:
+                    note += f"；{transfer['note']}"
+                self._append_event(conn, evidence_id, "TRANSFER", user_id,
+                                   from_person=transfer["from_person"], to_person=transfer["to_person"],
+                                   location=transfer["location"], note=note)
+                self._audit(conn, row["case_id"], user_id, "custody.transfer.confirm",
+                            {"evidence_id": evidence_id, "transfer_no": transfer["transfer_no"],
+                             "from": transfer["from_person"], "to": transfer["to_person"]})
+                return {"id": evidence_id, "transfer_no": transfer["transfer_no"], "status": "confirmed",
+                        "current_custodian": transfer["to_person"]}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def withdraw_transfer(self, user_id, evidence_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                self._user(conn, user_id)
+                transfer = self._pending_transfer(conn, evidence_id)
+                if not transfer:
+                    raise BusinessError("该证据没有待处理的交接", 409, "no_pending_transfer")
+                if transfer["initiated_by"] != user_id:
+                    raise BusinessError("只有交接发起人可以撤回", 403, "forbidden")
+                ts = now()
+                conn.execute("UPDATE transfers SET status='withdrawn', decided_by=?, decided_at=?, updated_at=? WHERE id=?",
+                             (user_id, ts, ts, transfer["id"]))
+                self._audit(conn, row["case_id"], user_id, "custody.transfer.withdraw",
+                            {"evidence_id": evidence_id, "transfer_no": transfer["transfer_no"]})
+                return {"id": evidence_id, "transfer_no": transfer["transfer_no"], "status": "withdrawn",
+                        "current_custodian": row["current_custodian"]}
+            except Exception:
+                conn.rollback()
+                raise
+
+    def resubmit_transfer(self, user_id, evidence_id):
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = self._evidence(conn, evidence_id)
+                self._user(conn, user_id)
+                transfer = self._pending_transfer(conn, evidence_id)
+                if not transfer:
+                    raise BusinessError("该证据没有待处理的交接", 409, "no_pending_transfer")
+                if transfer["initiated_by"] != user_id:
+                    raise BusinessError("只有原发起人可以重新提交交接", 403, "forbidden")
+                if row["legal_hold"]:
+                    raise BusinessError("法律保留仍生效，无法重新提交交接", 409, "legal_hold_active")
+                conn.execute("UPDATE transfers SET last_reject_reason=NULL, updated_at=? WHERE id=?",
+                             (now(), transfer["id"]))
+                self._audit(conn, row["case_id"], user_id, "custody.transfer.resubmit",
+                            {"evidence_id": evidence_id, "transfer_no": transfer["transfer_no"]})
+                return {"id": evidence_id, "transfer_no": transfer["transfer_no"], "status": "pending",
+                        "to_person": transfer["to_person"]}
             except Exception:
                 conn.rollback()
                 raise
@@ -276,6 +418,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._require_no_pending_transfer(conn, evidence_id, "开箱")
                 if row["status"] != "custody":
                     raise BusinessError("只有处于封存保管状态的证据可以开箱", 409, "invalid_status")
                 self._append_event(conn, evidence_id, "OPEN", user_id, from_person=row["current_custodian"], location=location.strip(), note=note.strip())
@@ -299,6 +442,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 parent = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, parent["case_id"], user_id, {"analyst"})
+                self._require_no_pending_transfer(conn, evidence_id, "派生分析")
                 if parent["status"] != "opened":
                     raise BusinessError("原始证据必须先开箱才能分析", 409, "evidence_not_opened")
                 cur = conn.execute(
@@ -344,6 +488,7 @@ class CustodyStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._evidence(conn, evidence_id)
                 _, member = self._member(conn, row["case_id"], user_id, {"custodian"})
+                self._require_no_pending_transfer(conn, evidence_id, "释放")
                 if row["legal_hold"]:
                     raise BusinessError("存在法律保留，禁止释放证据", 409, "legal_hold_active")
                 if row["status"] == "released":
@@ -379,6 +524,7 @@ class CustodyStore:
                     "id": row["id"], "label": row["label"], "filename": row["filename"], "sha256": row["sha256"],
                     "size": row["size"], "status": row["status"], "current_custodian": row["current_custodian"],
                     "legal_hold": bool(row["legal_hold"]), "retention_until": row["retention_until"],
+                    "pending_transfer": self._transfer_dict(self._pending_transfer(conn, row["id"])),
                     "hash_valid": hash_valid, "chain_valid": chain_valid,
                     "events": [dict(e) for e in events],
                     "derivatives": [dict(x) for x in conn.execute("SELECT * FROM derivatives WHERE parent_evidence_id=? ORDER BY id", (row["id"],)).fetchall()],
@@ -425,11 +571,16 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==3 and method=="GET": return self._send(200,store.get_evidence(user,evidence_id,bool(urlparse(self.path).query)))
             if len(parts)==4 and method=="POST":
                 d=self._body()
-                if parts[3]=="transfer": return self._send(200,store.transfer(user,evidence_id,d.get("to_person",""),d.get("location",""),d.get("note","")))
+                if parts[3]=="transfer": return self._send(201,store.transfer(user,evidence_id,d.get("to_person",""),d.get("location",""),d.get("note","")))
                 if parts[3]=="open": return self._send(200,store.open_evidence(user,evidence_id,d.get("location",""),d.get("note","")))
                 if parts[3]=="derive": return self._send(201,store.derive(user,evidence_id,d.get("method",""),d.get("label",""),d.get("filename",""),d.get("content_b64","")))
                 if parts[3]=="release": return self._send(200,store.release(user,evidence_id,d.get("recipient",""),d.get("note","")))
                 if parts[3]=="hold": return self._send(200,store.set_hold(user,evidence_id,bool(d.get("hold")),d.get("reason","")))
+            if len(parts)==5 and parts[3]=="transfer" and method=="POST":
+                self._body()
+                if parts[4]=="confirm": return self._send(200,store.confirm_transfer(user,evidence_id))
+                if parts[4]=="withdraw": return self._send(200,store.withdraw_transfer(user,evidence_id))
+                if parts[4]=="resubmit": return self._send(200,store.resubmit_transfer(user,evidence_id))
         raise BusinessError("接口不存在",404,"not_found")
     def _handle(self, method):
         try: self._dispatch(method)

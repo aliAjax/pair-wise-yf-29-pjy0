@@ -1,4 +1,77 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}
+select,input,button{padding:8px;margin:4px}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}
+.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}
+#handover{padding:8px;border-radius:6px;background:#f4f4f4}
+#handover.pending{background:#fff7e0;border:1px solid #e0c060}
+#handover .reject{color:#b00020;font-weight:700}
+.ok{color:#087f23;font-weight:600}
+</style></head>
+<body>
+<h1>法律证据保管与流转</h1>
+<div class="panel">
+  身份 <select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select>
+  案件 <input id="case" value="1" size="4">
+  证据 <input id="eid" value="1" size="4">
+  <button onclick="loadEvidence()">查看证据</button>
+  <button onclick="loadReport()">生成保管报告</button>
+</div>
+<div class="panel">
+  <h2>两步移交</h2>
+  <div>
+    接收人 <input id="toPerson" value="custodian2">
+    保管位置 <input id="loc" value="法院证物库">
+    备注 <input id="note" placeholder="可选">
+  </div>
+  <div>
+    <button onclick="initiate()">发起移交</button>
+    <button onclick="confirmTransfer()">确认交接</button>
+    <button onclick="withdrawTransfer()">撤回交接</button>
+    <button onclick="resubmitTransfer()">重新提交</button>
+  </div>
+  <p id="handover">交接状态：未加载</p>
+</div>
+<pre id="out"></pre>
+<script>
+let timer=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+async function api(path,opts={}){
+  const r=await fetch(path,{...opts,headers:{"Content-Type":"application/json","X-User-Id":$("user").value}});
+  const data=await r.json();
+  if(!r.ok) throw data;
+  return data;
+}
+function show(x){$("out").textContent=typeof x==="string"?x:JSON.stringify(x,null,2)}
+async function run(fn){
+  try{await fn()}
+  catch(e){show(e&&e.error?`${e.error.code}: ${e.error.message}`:String(e))}
+  finally{await refreshEvidence().catch(()=>{})}
+}
+function renderHandover(ev){
+  const el=$("handover"),p=ev.pending_transfer;
+  if(!p){el.className="";el.innerHTML='交接状态：<span class="ok">无待处理交接</span>';return}
+  el.className="pending";
+  let html=`交接状态：交接中 ${esc(p.transfer_no)}｜原保管人 ${esc(p.from_person)} → 待接收人 ${esc(p.to_person)}｜发起人 ${esc(p.initiated_by)}`;
+  if(p.last_reject_reason) html+=`<br><span class="reject">拒绝原因：${esc(p.last_reject_reason)}（待原发起人重新提交）</span>`;
+  el.innerHTML=html;
+}
+async function refreshEvidence(){
+  const ev=await api(`/api/evidence/${$("eid").value}`);
+  renderHandover(ev);
+  if(ev.pending_transfer&&!timer) timer=setInterval(()=>refreshEvidence().catch(()=>{}),5000);
+  if(!ev.pending_transfer&&timer){clearInterval(timer);timer=null}
+  return ev;
+}
+async function loadEvidence(){return run(async()=>{show(await refreshEvidence())})}
+async function loadReport(){return run(async()=>{show(await api(`/api/cases/${$("case").value}/report`))})}
+async function initiate(){return run(async()=>{
+  show(await api(`/api/evidence/${$("eid").value}/transfer`,{method:"POST",
+    body:JSON.stringify({to_person:$("toPerson").value,location:$("loc").value,note:$("note").value})}));
+})}
+async function confirmTransfer(){return run(async()=>{show(await api(`/api/evidence/${$("eid").value}/transfer/confirm`,{method:"POST",body:"{}"}))})}
+async function withdrawTransfer(){return run(async()=>{show(await api(`/api/evidence/${$("eid").value}/transfer/withdraw`,{method:"POST",body:"{}"}))})}
+async function resubmitTransfer(){return run(async()=>{show(await api(`/api/evidence/${$("eid").value}/transfer/resubmit`,{method:"POST",body:"{}"}))})}
+</script></body></html>
