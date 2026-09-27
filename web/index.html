@@ -1,4 +1,137 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>法律证据保管</title>
-<style>body{font:16px system-ui;max-width:980px;margin:32px auto;padding:0 16px}select,input,button{padding:8px;margin:4px}pre{background:#f4f4f4;padding:12px;white-space:pre-wrap}.panel{border:1px solid #bbb;padding:16px;border-radius:8px}</style></head>
-<body><h1>法律证据保管与流转</h1><div class="panel"><select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select><input id="case" value="1"><button onclick="load()">生成保管报告</button></div><pre id="out"></pre>
-<script>async function load(){const r=await fetch(`/api/cases/${case.value}/report`,{headers:{"X-User-Id":user.value}});out.textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<style>
+body{font:15px system-ui,sans-serif;max-width:1040px;margin:24px auto;padding:0 16px;color:#222}
+select,input,button,textarea{padding:7px;margin:3px;font:inherit}
+button{cursor:pointer;border-radius:5px;border:1px solid #888;background:#fff}
+button.primary{background:#1f5fbf;color:#fff;border-color:#1f5fbf}
+button.danger{color:#a3212b;border-color:#a3212b}
+.panel{border:1px solid #bbb;padding:14px;border-radius:8px;margin:12px 0}
+.ev{border:1px solid #ccc;border-radius:8px;padding:12px;margin:10px 0}
+.ev h3{margin:0 0 6px}
+.meta{color:#555;font-size:14px;line-height:1.7}
+.tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;margin-right:6px}
+.t-custody{background:#e6f0ff}.t-opened{background:#fff3cd}.t-released{background:#ddd}.t-derivative{background:#e8f5e9}.t-in_transit{background:#fde7ec}
+.ho{border-left:4px solid #1f5fbf;background:#f6f9ff;padding:10px 12px;margin:8px 0;border-radius:0 6px 6px 0}
+.ho.blocked{border-left-color:#c0392b;background:#fdf3f2}
+.ho.confirmed{border-left-color:#2e7d32;background:#f2f8f2}
+.ho.withdrawn{border-left-color:#999;background:#f5f5f5}
+.reason{color:#a3212b;font-weight:600;margin:6px 0}
+.muted{color:#777;font-size:13px}
+.history{font-size:13px;color:#444;margin-top:6px}
+.history td{padding:2px 10px 2px 0;vertical-align:top}
+pre{background:#f4f4f4;padding:12px;white-space:pre-wrap;border-radius:8px}
+.ok{color:#2e7d32}.err{color:#a3212b}
+.actions button,.actions form{display:inline-block}
+label.field{display:inline-block;margin-right:8px}
+</style></head>
+<body>
+<h1>法律证据保管与流转</h1>
+<div class="panel">
+  <label class="field">当前身份
+    <select id="user"><option>custodian1</option><option>custodian2</option><option>analyst1</option><option>auditor1</option><option>outsider</option></select>
+  </label>
+  <label class="field">案件 ID <input id="case" value="1" size="5"></label>
+  <button class="primary" onclick="load()">生成保管报告</button>
+  <span id="msg"></span>
+</div>
+<div id="list"></div>
+<details style="margin:12px 0"><summary>原始 JSON 报告</summary><pre id="out">（点击“生成保管报告”加载）</pre></details>
+
+<script>
+const $=id=>document.getElementById(id);
+let REPORT=null;
+const STATUS_TEXT={custody:"封存保管",opened:"已开箱",released:"已释放",derivative:"衍生证据",in_transit:"交接中"};
+const HO_TEXT={pending:"待接收人确认",blocked:"法律保留阻断",confirmed:"已完成",withdrawn:"已撤回"};
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+function api(path,method="POST",body){
+  return fetch(path,{method,headers:{"X-User-Id":$("user").value,"Content-Type":"application/json"},
+    body:body?JSON.stringify(body):undefined}).then(async r=>{const j=await r.json();if(!r.ok)throw Object.assign(new Error(j.error?.message||"请求失败"),{payload:j});return j});
+}
+async function act(promiseFactory){
+  $("msg").textContent="";try{await promiseFactory();await load()}catch(e){$("msg").innerHTML='<span class="err">'+esc(e.message)+'</span>'}
+}
+async function load(){
+  $("msg").textContent="";
+  const r=await fetch(`/api/cases/${$("case").value}/report`,{headers:{"X-User-Id":$("user").value}});
+  const j=await r.json();$("out").textContent=JSON.stringify(j,null,2);
+  if(!r.ok){$("list").innerHTML='<p class="err">'+esc(j.error?.message||"加载失败")+'</p>';REPORT=null;return}
+  REPORT=j;render();
+}
+const custodians=()=>new Set((REPORT.members||[]).filter(m=>m.active&&m.role==="custodian").map(m=>m.user_id));
+function hoPanel(ev){
+  const a=ev.active_handover;
+  if(!a)return ev.handovers&&ev.handovers.length
+    ?`<div class="muted">最近交接：${hoHistory(ev)}</div>`:"";
+  const blocked=a.status==="blocked";
+  const u=$("user").value;
+  let btns="";
+  if(a.status==="pending"&&a.to_person===u)
+    btns+=`<button class="primary" onclick="act(()=>api('/api/evidence/${ev.id}/transfer/confirm'))">确认接收</button>`;
+  if(blocked&&!ev.legal_hold&&a.initiated_by===u)
+    btns+=`<button class="primary" onclick="act(()=>api('/api/evidence/${ev.id}/transfer/resubmit'))">重新提交</button>`;
+  if(a.initiated_by===u)
+    btns+=`<button class="danger" onclick="act(()=>api('/api/evidence/${ev.id}/transfer/withdraw'))">撤回交接</button>`;
+  const hold=blocked&&ev.legal_hold?`<div class="muted">法律保留生效中，解除后由原发起人重新提交。</div>`:"";
+  const reject=a.reject_reason?`<div class="reason">拒绝原因：${esc(a.reject_reason)}</div>`:"";
+  const holdReason=blocked&&a.hold_reason?`<div>保留原因：${esc(a.hold_reason)}</div>`:"";
+  const resub=a.resubmitted_at?`<div class="muted">原发起人已于 ${esc(a.resubmitted_at)} 重新提交</div>`:"";
+  return `<div class="ho ${a.status}">
+    <b>交接编号 ${esc(a.handover_number)}</b> — ${HO_TEXT[a.status]||a.status}
+    <div class="meta">原保管人：<b>${esc(a.from_person)}</b> → 待接收人：<b>${esc(a.to_person)}</b>；保管位置：${esc(a.location)}；发起人：${esc(a.initiated_by)}（${esc(a.initiated_at)}）${a.note?"；备注："+esc(a.note):""}</div>
+    ${holdReason}${reject}${resub}${hold}
+    <div class="actions">${btns}</div>
+    ${hoHistory(ev)}
+  </div>`;
+}
+function hoHistory(ev){
+  const done=(ev.handovers||[]).filter(h=>h.status==="confirmed"||h.status==="withdrawn");
+  if(!done.length)return"";
+  const rows=done.slice().reverse().map(h=>`<tr><td>${esc(h.handover_number)}</td><td>${HO_TEXT[h.status]}</td>
+    <td>${esc(h.from_person)} → ${esc(h.to_person)}</td><td>${esc(h.confirmed_at||h.withdrawn_at||"")}</td></tr>`).join("");
+  return `<details class="history"><summary>历史交接（${done.length}）</summary><table>${rows}</table></details>`;
+}
+function startForm(ev){
+  const u=$("user").value;
+  if(ev.status==="released"||ev.active_handover||ev.current_custodian!==u)return"";
+  const opts=[...custodians()].filter(x=>x!==u).map(x=>`<option>${esc(x)}</option>`).join("");
+  if(!opts)return"";
+  return `<form class="actions" onsubmit="event.preventDefault();act(async()=>{
+      await api('/api/evidence/${ev.id}/transfer','POST',{to_person:this.to.value,location:this.loc.value,note:this.note.value});})">
+    <label class="field">移交给 <select name="to">${opts}</select></label>
+    <label class="field">保管位置 <input name="loc" placeholder="如：法院证物库" required></label>
+    <label class="field">备注 <input name="note"></label>
+    <button class="primary" type="submit">发起交接</button>
+  </form>`;
+}
+function otherActions(ev){
+  const u=$("user").value,me=custodians().has(u),aud=(REPORT.members||[]).some(m=>m.user_id===u&&m.active&&m.role==="auditor")||REPORT.case?.created_by===u;
+  let b="";
+  if(ev.status==="custody"&&me&&!ev.active_handover)
+    b+=`<button onclick="const v=prompt('开箱地点');if(v)act(()=>api('/api/evidence/${ev.id}/open','POST',{location:v}))">开箱</button>`;
+  if(me&&!ev.active_handover&&ev.status!=="released")
+    b+=`<button onclick="const v=prompt('释放接收方');if(v)act(()=>api('/api/evidence/${ev.id}/release','POST',{recipient:v}))">释放</button>`;
+  if(aud)
+    b+=ev.legal_hold
+      ?`<button onclick="const v=prompt('解除保留原因（至少5字）');if(v)act(()=>api('/api/evidence/${ev.id}/hold','POST',{hold:false,reason:v}))">解除法律保留</button>`
+      :`<button class="danger" onclick="const v=prompt('法律保留原因（至少5字）');if(v)act(()=>api('/api/evidence/${ev.id}/hold','POST',{hold:true,reason:v}))">设置法律保留</button>`;
+  return b?`<div class="actions">${b}</div>`:"";
+}
+function render(){
+  $("list").innerHTML=`<div class="panel"><b>${esc(REPORT.case.case_number)}</b> ${esc(REPORT.case.title)}
+    <span class="muted">（共 ${REPORT.evidence_count} 项证据；整体完整性：${REPORT.overall_integrity_valid?'<span class="ok">通过</span>':'<span class="err">异常</span>'}）</span></div>`
+  +REPORT.evidence.map(ev=>`<div class="ev">
+    <h3>#${ev.id} ${esc(ev.label)} <span class="tag t-${ev.status}">${STATUS_TEXT[ev.status]||ev.status}</span>
+      ${ev.legal_hold?'<span class="tag t-in_transit">法律保留</span>':""}
+      ${ev.active_handover?`<span class="tag t-in_transit">交接中：${HO_TEXT[ev.active_handover.status]}</span>`:""}</h3>
+    <div class="meta">文件：${esc(ev.filename)}；大小：${ev.size} 字节；当前保管人：<b>${esc(ev.current_custodian)}</b>
+      ${ev.active_handover?`；待接收人：<b>${esc(ev.active_handover.to_person)}</b>`:""}
+      <br>SHA-256：${esc(ev.sha256)}；保留至 ${esc(ev.retention_until)}；
+      完整性 ${ev.hash_valid?'<span class="ok">通过</span>':'<span class="err">异常</span>'}，
+      事件链 ${ev.chain_valid?'<span class="ok">通过</span>':'<span class="err">异常</span>'}</div>
+    ${hoPanel(ev)}
+    ${startForm(ev)}
+    ${otherActions(ev)}
+  </div>`).join("");
+}
+load();
+</script></body></html>
